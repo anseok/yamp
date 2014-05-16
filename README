@@ -1,0 +1,4 @@
+yamp is Yet Another Minimiser for PHP.
+
+Put 'yamp' and 'phplex.py' under a same directory in your execution
+path.  Then run 'yamp -h' to read the manual.

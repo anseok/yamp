@@ -1,0 +1,196 @@
+#!/usr/bin/python
+
+# Yet Another Minimiser for PHP (yamp) v0.2.2014-04-01
+# Author: Anseok Joo (anseok at gmail dot com)
+# Public Domain
+
+# Run 'yamp -h' for usage info.
+
+# changelog ############################################################
+# v0.2.2014-04-01
+#   - added optional class & public method name renaming
+#   - fixed bug in firstNewlineAndRemainder
+#   - released to public domain
+# v0.1.2014-01-22
+#   - first release
+
+import argparse, os
+import phplex as l
+
+# customisables ########################################################
+fillWidth = 72
+contact = 'anseok at gmail dot com'
+version = '0.2.2014-04-01'
+
+# functions ############################################################
+def isDir(path, perm):
+  '''whether path exists and is accessible
+set perm to os.R_OK to check readability; os.W_OK for writability'''
+  return os.path.isdir(path) and os.access(path, os.X_OK | perm)
+
+def parseArgs(contact, version):
+  'parses and returns arguments'
+  parser = argparse.ArgumentParser(
+    formatter_class = argparse.RawDescriptionHelpFormatter,
+    description ='''\
+Yet Another Minimiser for PHP (yamp) v{}
+
+yamp minimises all PHP files under SrcDir and outputs to DstDir.
+Identifiers and keywords not intended to be renamed are specified in
+ImmutablesFile.  Class names and public method names are not renamed,
+unless specified otherwise with -c flag.
+
+A more frequently occurring identifier gets a shorter name.  The mapping
+from the new identifiers to the old identifiers is printed on STDOUT, so
+that in case the PHP code breaks from renaming, it is easy to lookup old
+identifiers and add them to ImmutablesFile.
+
+Also, all unnecessary whitespaces are stripped, and an attempt is made
+to align to {} character line width without increasing the output size.\
+'''.format(version, fillWidth),
+    epilog = 'Report bugs to ' + contact)
+  parser.add_argument(
+    'ImmutablesFile', type = argparse.FileType('r'), help =
+'text file containing whitespace-separated identifiers and keywords that should not be renamed during minimisation'
+    )
+  parser.add_argument(
+    'SrcDir', help =
+'source directory; all PHP files (recursively) under SrcDir are minimised'
+    )
+  parser.add_argument(
+    'DstDir', help =
+"destination directory; DstDir's structure replicates that of SrcDir"
+    )
+  parser.add_argument(
+    '-c', action = 'store_true', help =
+'also minimise class names and public method names; disabled by default'
+    )
+  parser.add_argument(
+    '-v', action = 'version', version = '%(prog)s ' + version)
+  args = parser.parse_args()
+  immutables = args.ImmutablesFile.read(); args.ImmutablesFile.close()
+  assert isDir(args.SrcDir, os.R_OK)
+  return (set(immutables.lower().split()),
+          os.path.normpath(args.SrcDir), os.path.normpath(args.DstDir),
+          args.c)
+
+def inPaths(srcDir):
+  'path to all PHP files under source directory'
+  return [os.path.join(root, name)
+          for root, _, names in os.walk(srcDir)
+          for name in names
+          if os.path.splitext(name)[1].lower() == '.php']
+
+def lowerId(k, v):
+  'lowercase identifier'
+  return (v[1:] if k == 'T_VARIABLE' else v).lower()
+
+def classIds(inNames):
+  'create set of class and public method names to be left unchanged'
+  s = set()
+  for name in inNames:
+    add = False
+    for k, v in l.lex(name):
+      if k in l.imm_prefix: add = True
+      elif add and k in l.id: s.add(lowerId(k, v)); add = False
+  return s
+
+def tallyIds(inNames, immutables):
+  'generate dictionary of identifiers and their # occurrences'
+  d = {}
+  for name in inNames:
+    for k, v in l.lex(name):
+      if k not in l.id: continue
+      v = lowerId(k, v)
+      if v not in immutables: d[v] = d.get(v, 0) + 1
+  return d
+
+def base26(i):
+  'encode integer into base 26 where digits are lowercase letters'
+  lst = []
+  while i > 0: i, r = divmod(i, 26); lst.append(chr(r + 97))
+  return ''.join(reversed(lst)) if lst else 'a'
+
+# stream functions #####################################################
+def idStream(immutables):
+  'generate stream of identifiers that do not collide with immutables'
+  i = 0
+  while True:
+    s = base26(i); i += 1
+    if s not in immutables: yield s
+
+def rename(mapping, tokens):
+  'rename identifiers and filter out skippable tokens'
+  for k, v in tokens:
+    if k in l.skip: continue
+    isVar = k == 'T_VARIABLE'
+    if isVar: v = v[1:]
+    if k in l.id: v = mapping.get(v.lower(), v)
+    if isVar: v = '$' + v
+    yield k, v
+
+def addSpaces(tokens):
+  'add only spaces needed to keep tokens separate'
+  last = 'dummy'
+  for k, v in tokens:
+    if last in l.right and k in l.left:
+      # a list, not a tuple, is yielded, so that the space can be
+      # replaced with a newline later
+      yield ['T_WHITESPACE', ' ']
+    yield k, v; last = k
+
+def firstNewlineAndRemainder(token):
+  '''compute index of first newline and # letters after last newline.
+if token contains no newline, # letters after newline is -1'''
+  k, v = token; n = len(v)
+  if k not in l.nl: return n, -1
+  i = v.find('\n')
+  return (n, i) if i < 0 else (i, n - v.rfind('\n') - 1)
+
+def addNewlines(fillWidth, tokens):
+  'convert T_WHITESPACE spaces to newlines to fit within fill-width'
+  ret, point, lastSpace = [], 0, []
+  for t in tokens:
+    ret.append(t); k, v = t
+    if k == 'T_WHITESPACE':
+      point += 1; lastSpace = t; lastPoint = point; continue
+    # this works because consecutive T_WHITESPACEs don't exist and
+    # T_WHITESPACE never occurs at the end of the token stream
+    i, r = firstNewlineAndRemainder(t)
+    outOfBound = lastSpace and point + i > fillWidth
+    if r >= 0:  # v contains newline
+      if outOfBound: lastSpace[1] = '\n'
+      lastSpace = []; point = r; continue
+    if outOfBound:
+      lastSpace[1] = '\n'; lastSpace = []; point -= lastPoint
+    point += i
+  return ret
+
+# procedures ###########################################################
+def minimiseFile(mapping, srcDir, inName, dstDir):
+  'minimise one file'
+  outName = inName.replace(srcDir, dstDir, 1)
+  outDir = os.path.dirname(outName)
+  if not isDir(outDir, os.W_OK): os.makedirs(outDir)
+  l.unlex(addNewlines(fillWidth, addSpaces(
+        rename(mapping, l.lex(inName)))), outName)
+
+def printMapping(mapping):
+  'print new:old identifier mapping to stdout'
+  print 'NEW\tOLD\n======= ======='
+  for old, new in sorted(mapping.iteritems(), key = lambda x: x[1]):
+    print '{}\t{}'.format(new, old)
+
+def main():
+  immutables, srcDir, dstDir, renameCls = parseArgs(contact, version)
+  inNames = inPaths(srcDir)
+  immutables |= l.defaults | (set() if renameCls else classIds(inNames))
+  d = tallyIds(inNames, immutables)
+  mapping = dict(zip(sorted(d, key = lambda k: d[k], reverse = True),
+                     idStream(immutables)))
+  for name in inNames: minimiseFile(mapping, srcDir, name, dstDir)
+  printMapping(mapping)
+
+if __name__ == '__main__': main()
+
+# eof
